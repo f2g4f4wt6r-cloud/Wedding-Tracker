@@ -172,6 +172,17 @@ const DEFAULT_DATA = {
 let data = null;
 let currentPage = "dashboard";
 
+/* =========================================================
+   SUPABASE PERSISTENCE
+   ========================================================= */
+
+const WEDDING_ID_KEY = "amoreWeddingPlanner_wedding_id";
+let weddingId = localStorage.getItem(WEDDING_ID_KEY) || "";
+let supabaseReady = false;
+let supabaseSyncTimer = null;
+let supabaseSyncRunning = false;
+let supabaseSyncQueued = false;
+
 window.guestQ = "";
 window.taskFilter = "all";
 window.toastT = null;
@@ -570,6 +581,603 @@ function normalize() {
 
 
 /* =========================================================
+   SUPABASE DATABASE HELPERS
+   ========================================================= */
+
+function supabaseRestUrl(path = "") {
+  return `${DATABASE_CONFIG.url.replace(/\/$/, "")}/rest/v1/${path}`;
+}
+
+async function supabaseFetch(path, options = {}) {
+  if (!DATABASE_CONFIG.enabled) {
+    throw new Error("Supabase database is disabled.");
+  }
+
+  const headers = {
+    apikey: DATABASE_CONFIG.anonKey,
+    Authorization: `Bearer ${DATABASE_CONFIG.anonKey}`,
+    "Content-Type": "application/json",
+    ...options.headers
+  };
+
+  if (options.method === "POST" || options.method === "PATCH") {
+    headers.Prefer = headers.Prefer || "return=representation";
+  }
+
+  const response = await fetch(
+    supabaseRestUrl(path),
+    {
+      ...options,
+      headers
+    }
+  );
+
+  const bodyText = await response.text();
+  let body = null;
+
+  if (bodyText) {
+    try {
+      body = JSON.parse(bodyText);
+    } catch {
+      body = bodyText;
+    }
+  }
+
+  if (!response.ok) {
+    const detail =
+      typeof body === "string"
+        ? body
+        : body?.message || body?.details || body?.hint || JSON.stringify(body);
+
+    throw new Error(
+      `Supabase ${response.status}: ${detail || response.statusText}`
+    );
+  }
+
+  return body;
+}
+
+function hasUserEnteredData() {
+  const coupleHasData = Boolean(
+    String(data?.couple?.name || "").trim() ||
+    String(data?.couple?.date || "").trim() ||
+    String(data?.couple?.venue || "").trim()
+  );
+
+  const budgetHasData =
+    Number(data?.budget?.total || 0) > 0 ||
+    (data?.budget?.categories || []).some(
+      x =>
+        String(x?.name || "").trim() ||
+        Number(x?.amount || 0) > 0 ||
+        Number(x?.spent || 0) > 0
+    );
+
+  const additionalHasData =
+    Number(data?.additionalExpenses?.budget || 0) > 0 ||
+    (data?.additionalExpenses?.items || []).length > 0;
+
+  return Boolean(
+    coupleHasData ||
+    budgetHasData ||
+    additionalHasData ||
+    (data?.guests || []).length ||
+    (data?.vendors || []).length ||
+    (data?.notes || []).length ||
+    (data?.googleRsvp?.responses || []).length
+  );
+}
+
+async function getWeddingRow(id) {
+  const query = id
+    ? `weddings?id=eq.${encodeURIComponent(id)}&select=*&limit=1`
+    : "weddings?select=*&order=created_at.asc&limit=1";
+
+  const rows = await supabaseFetch(query, {
+    method: "GET",
+    headers: { Prefer: "return=representation" }
+  });
+
+  return Array.isArray(rows) ? rows[0] || null : null;
+}
+
+async function createWeddingRow() {
+  const rows = await supabaseFetch("weddings", {
+    method: "POST",
+    body: JSON.stringify({
+      couple_name: data.couple?.name || "",
+      wedding_date: data.couple?.date || null,
+      venue: data.couple?.venue || ""
+    })
+  });
+
+  const row = Array.isArray(rows) ? rows[0] : rows;
+
+  if (!row?.id) {
+    throw new Error("Supabase did not return a wedding ID.");
+  }
+
+  weddingId = row.id;
+  localStorage.setItem(WEDDING_ID_KEY, weddingId);
+
+  return row;
+}
+
+async function ensureWeddingRow() {
+  if (weddingId) {
+    const existing = await getWeddingRow(weddingId);
+
+    if (existing?.id) {
+      return existing;
+    }
+
+    weddingId = "";
+    localStorage.removeItem(WEDDING_ID_KEY);
+  }
+
+  const firstWedding = await getWeddingRow("");
+
+  if (firstWedding?.id) {
+    weddingId = firstWedding.id;
+    localStorage.setItem(WEDDING_ID_KEY, weddingId);
+    return firstWedding;
+  }
+
+  return createWeddingRow();
+}
+
+function dbDateOrNull(value) {
+  const v = String(value || "").trim();
+  return v || null;
+}
+
+async function replaceWeddingRows(table, rows) {
+  if (!weddingId) return;
+
+  await supabaseFetch(
+    `${table}?wedding_id=eq.${encodeURIComponent(weddingId)}`,
+    {
+      method: "DELETE",
+      headers: { Prefer: "return=minimal" }
+    }
+  );
+
+  if (!rows.length) return;
+
+  await supabaseFetch(table, {
+    method: "POST",
+    body: JSON.stringify(rows),
+    headers: { Prefer: "return=minimal" }
+  });
+}
+
+async function upsertWeddingSetting(key, value) {
+  /*
+     The supplied schema does not require a unique constraint on
+     (wedding_id, setting_key), so replace the setting explicitly.
+  */
+  await supabaseFetch(
+    `app_settings?wedding_id=eq.${encodeURIComponent(weddingId)}&setting_key=eq.${encodeURIComponent(key)}`,
+    {
+      method: "DELETE",
+      headers: { Prefer: "return=minimal" }
+    }
+  );
+
+  await supabaseFetch("app_settings", {
+    method: "POST",
+    body: JSON.stringify({
+      wedding_id: weddingId,
+      setting_key: key,
+      setting_value: String(value ?? "")
+    }),
+    headers: { Prefer: "return=minimal" }
+  });
+}
+
+async function getWeddingSettings() {
+  const rows = await supabaseFetch(
+    `app_settings?wedding_id=eq.${encodeURIComponent(weddingId)}&select=*`,
+    { method: "GET" }
+  );
+
+  const settings = {};
+
+  (Array.isArray(rows) ? rows : []).forEach(row => {
+    settings[row.setting_key] = row.setting_value;
+  });
+
+  return settings;
+}
+
+async function syncToSupabase() {
+  if (!DATABASE_CONFIG.enabled || !data) return;
+
+  const wedding = await ensureWeddingRow();
+
+  weddingId = wedding.id;
+  localStorage.setItem(WEDDING_ID_KEY, weddingId);
+
+  await supabaseFetch(
+    "weddings",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        id: weddingId,
+        couple_name: data.couple?.name || "",
+        wedding_date: dbDateOrNull(data.couple?.date),
+        venue: data.couple?.venue || "",
+        updated_at: new Date().toISOString()
+      }),
+      headers: {
+        Prefer: "resolution=merge-duplicates,return=minimal"
+      }
+    }
+  );
+
+  const budgetCategories = (data.budget?.categories || []).map(c => ({
+    wedding_id: weddingId,
+    name: String(c.name || ""),
+    amount: Number(c.amount) || 0,
+    spent: Number(c.spent) || 0
+  }));
+
+  await replaceWeddingRows(
+    "budget_categories",
+    budgetCategories
+  );
+
+  await supabaseFetch(
+    "additional_expense_settings",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        wedding_id: weddingId,
+        budget: Number(data.additionalExpenses?.budget) || 0
+      }),
+      headers: {
+        Prefer: "resolution=merge-duplicates,return=minimal"
+      }
+    }
+  );
+
+  const additionalExpenses =
+    (data.additionalExpenses?.items || []).map(x => ({
+      wedding_id: weddingId,
+      expense_date: dbDateOrNull(x.date),
+      category: String(x.category || "Other"),
+      description: String(x.description || "Additional expense"),
+      amount: Number(x.amount) || 0,
+      status: String(x.status || "Planned"),
+      notes: String(x.notes || "")
+    }));
+
+  await replaceWeddingRows(
+    "additional_expenses",
+    additionalExpenses
+  );
+
+  const guests = (data.guests || []).map(g => ({
+    wedding_id: weddingId,
+    name: String(g.name || ""),
+    side: String(g.side || "Bride"),
+    phone: String(g.phone || ""),
+    email: String(g.email || ""),
+    meal: String(g.meal || "Standard"),
+    plus_one: String(g.plusOne || "No"),
+    status: String(g.status || "Pending"),
+    notes: String(g.notes || "")
+  }));
+
+  await replaceWeddingRows("guests", guests);
+
+  const vendors = (data.vendors || []).map(v => ({
+    wedding_id: weddingId,
+    category: String(v.category || ""),
+    name: String(v.name || ""),
+    contact_person: String(v.contact || ""),
+    phone: String(v.phone || ""),
+    email: String(v.email || ""),
+    status: String(v.status || "Pending"),
+    total: Number(v.total) || 0,
+    paid: Number(v.paid) || 0,
+    due_date: dbDateOrNull(v.due),
+    notes: String(v.notes || "")
+  }));
+
+  await replaceWeddingRows("vendors", vendors);
+
+  const tasks = (data.tasks || []).map(t => ({
+    wedding_id: weddingId,
+    title: String(t.title || ""),
+    done: Boolean(t.done),
+    task_group: String(t.group || "12+ MONTHS BEFORE"),
+    due_date: dbDateOrNull(t.due),
+    priority: String(t.priority || "Medium")
+  }));
+
+  await replaceWeddingRows("tasks", tasks);
+
+  const notes = (data.notes || []).map(n => ({
+    wedding_id: weddingId,
+    title: String(n.title || ""),
+    text: String(n.text || "")
+  }));
+
+  await replaceWeddingRows("notes", notes);
+
+  const responses = (data.googleRsvp?.responses || []).map(r => ({
+    wedding_id: weddingId,
+    response_name: String(
+      r.name || r.Name || r["Name"] || r["Full Name"] || ""
+    ),
+    email: String(r.email || r.Email || ""),
+    phone: String(r.phone || r.Phone || ""),
+    rsvp_status: String(
+      r.status ||
+      r.Status ||
+      r.rsvp_status ||
+      r["RSVP Status"] ||
+      ""
+    ),
+    raw_response: r,
+    response_date: new Date().toISOString()
+  }));
+
+  await replaceWeddingRows("rsvp_responses", responses);
+
+  await upsertWeddingSetting(
+    "total_budget",
+    Number(data.budget?.total) || 0
+  );
+
+  await upsertWeddingSetting(
+    "google_sheet_url",
+    data.googleRsvp?.sheetUrl || ""
+  );
+
+  await upsertWeddingSetting(
+    "google_rsvp_last_sync",
+    data.googleRsvp?.lastSync || ""
+  );
+
+  await upsertWeddingSetting(
+    "google_rsvp_status",
+    data.googleRsvp?.status || "Not connected"
+  );
+}
+
+function scheduleSupabaseSync() {
+  if (!DATABASE_CONFIG.enabled || !supabaseReady) return;
+
+  clearTimeout(supabaseSyncTimer);
+
+  supabaseSyncTimer = setTimeout(async () => {
+    if (supabaseSyncRunning) {
+      supabaseSyncQueued = true;
+      return;
+    }
+
+    supabaseSyncRunning = true;
+
+    try {
+      await syncToSupabase();
+      console.log("Wedding data synced to Supabase.");
+    } catch (error) {
+      console.error("Supabase save failed:", error);
+      toast(
+        "Saved locally, but database sync failed. Check the browser console."
+      );
+    } finally {
+      supabaseSyncRunning = false;
+
+      if (supabaseSyncQueued) {
+        supabaseSyncQueued = false;
+        scheduleSupabaseSync();
+      }
+    }
+  }, 350);
+}
+
+async function loadFromSupabase() {
+  const wedding = await ensureWeddingRow();
+
+  weddingId = wedding.id;
+  localStorage.setItem(WEDDING_ID_KEY, weddingId);
+
+  const [
+    budgetRows,
+    additionalSettingRows,
+    additionalRows,
+    guestRows,
+    vendorRows,
+    taskRows,
+    noteRows,
+    responseRows,
+    settings
+  ] = await Promise.all([
+    supabaseFetch(
+      `budget_categories?wedding_id=eq.${encodeURIComponent(weddingId)}&select=*`,
+      { method: "GET" }
+    ),
+    supabaseFetch(
+      `additional_expense_settings?wedding_id=eq.${encodeURIComponent(weddingId)}&select=*`,
+      { method: "GET" }
+    ),
+    supabaseFetch(
+      `additional_expenses?wedding_id=eq.${encodeURIComponent(weddingId)}&select=*`,
+      { method: "GET" }
+    ),
+    supabaseFetch(
+      `guests?wedding_id=eq.${encodeURIComponent(weddingId)}&select=*`,
+      { method: "GET" }
+    ),
+    supabaseFetch(
+      `vendors?wedding_id=eq.${encodeURIComponent(weddingId)}&select=*`,
+      { method: "GET" }
+    ),
+    supabaseFetch(
+      `tasks?wedding_id=eq.${encodeURIComponent(weddingId)}&select=*`,
+      { method: "GET" }
+    ),
+    supabaseFetch(
+      `notes?wedding_id=eq.${encodeURIComponent(weddingId)}&select=*`,
+      { method: "GET" }
+    ),
+    supabaseFetch(
+      `rsvp_responses?wedding_id=eq.${encodeURIComponent(weddingId)}&select=*`,
+      { method: "GET" }
+    ),
+    getWeddingSettings()
+  ]);
+
+  data.couple.name = wedding.couple_name || "";
+  data.couple.date = wedding.wedding_date || "";
+  data.couple.venue = wedding.venue || "";
+
+  data.budget.total = Number(settings.total_budget ?? 0) || 0;
+  data.budget.categories = (Array.isArray(budgetRows) ? budgetRows : []).map(c => ({
+    id: c.id,
+    name: c.name || "",
+    amount: Number(c.amount) || 0,
+    spent: Number(c.spent) || 0,
+    remaining: budgetRemaining(c.amount, c.spent)
+  }));
+
+  const additionalSetting =
+    Array.isArray(additionalSettingRows)
+      ? additionalSettingRows[0]
+      : null;
+
+  data.additionalExpenses.budget =
+    Number(additionalSetting?.budget ?? 0) || 0;
+
+  data.additionalExpenses.items =
+    (Array.isArray(additionalRows) ? additionalRows : []).map(x => ({
+      id: x.id,
+      date: x.expense_date || "",
+      category: x.category || "Other",
+      description: x.description || "Additional expense",
+      amount: Number(x.amount) || 0,
+      status: x.status || "Planned",
+      notes: x.notes || ""
+    }));
+
+  data.guests =
+    (Array.isArray(guestRows) ? guestRows : []).map(g => ({
+      id: g.id,
+      name: g.name || "",
+      phone: g.phone || "",
+      email: g.email || "",
+      side: g.side || "Bride",
+      meal: g.meal || "Standard",
+      status: g.status || "Pending",
+      plusOne: g.plus_one || "No",
+      notes: g.notes || ""
+    }));
+
+  data.vendors =
+    (Array.isArray(vendorRows) ? vendorRows : []).map(v => ({
+      id: v.id,
+      category: v.category || "",
+      name: v.name || "",
+      contact: v.contact_person || "",
+      phone: v.phone || "",
+      email: v.email || "",
+      status: v.status || "Pending",
+      total: Number(v.total) || 0,
+      paid: Number(v.paid) || 0,
+      due: v.due_date || "",
+      notes: v.notes || ""
+    }));
+
+  data.tasks =
+    (Array.isArray(taskRows) ? taskRows : []).map(t => ({
+      id: t.id,
+      title: t.title || "",
+      done: Boolean(t.done),
+      group: t.task_group || "12+ MONTHS BEFORE",
+      due: t.due_date || "",
+      priority: t.priority || "Medium"
+    }));
+
+  data.notes =
+    (Array.isArray(noteRows) ? noteRows : []).map(n => ({
+      id: n.id,
+      title: n.title || "",
+      text: n.text || "",
+      updated: n.updated_at || ""
+    }));
+
+  const savedResponses =
+    (Array.isArray(responseRows) ? responseRows : []).map(r =>
+      r.raw_response && typeof r.raw_response === "object"
+        ? r.raw_response
+        : {
+            name: r.response_name || "",
+            email: r.email || "",
+            phone: r.phone || "",
+            status: r.rsvp_status || ""
+          }
+    );
+
+  data.googleRsvp.responses = savedResponses;
+  data.googleRsvp.sheetUrl =
+    settings.google_sheet_url ||
+    DEFAULT_GOOGLE_SHEET_URL;
+  data.googleRsvp.lastSync =
+    settings.google_rsvp_last_sync || "";
+  data.googleRsvp.status =
+    settings.google_rsvp_status ||
+    (savedResponses.length ? "Connected" : "Not connected");
+
+  normalize();
+}
+
+async function initializeDatabasePersistence() {
+  if (!DATABASE_CONFIG.enabled) {
+    return;
+  }
+
+  try {
+    if (!weddingId && hasUserEnteredData()) {
+      const wedding = await ensureWeddingRow();
+      weddingId = wedding.id;
+      localStorage.setItem(WEDDING_ID_KEY, weddingId);
+
+      supabaseReady = true;
+      await syncToSupabase();
+
+      localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify(data)
+      );
+
+      console.log("Existing local wedding data migrated to Supabase.");
+      return;
+    }
+
+    await loadFromSupabase();
+    supabaseReady = true;
+
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(data)
+    );
+
+    render();
+    console.log("Wedding data loaded from Supabase.");
+  } catch (error) {
+    supabaseReady = false;
+    console.error("Could not initialize Supabase persistence:", error);
+    toast(
+      "Database could not be reached. Your data is still saved in this browser."
+    );
+  }
+}
+
+
+/* =========================================================
    LOCAL STORAGE
    ========================================================= */
 
@@ -609,13 +1217,14 @@ function loadData() {
 function saveData() {
 
   try {
-
     normalize();
 
     localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify(data)
     );
+
+    scheduleSupabaseSync();
 
     return true;
 
@@ -633,7 +1242,6 @@ function saveData() {
     return false;
   }
 }
-
 
 /* =========================================================
    NAVIGATION
@@ -6810,6 +7418,22 @@ function startGoogleAutoSync() {
 
 
 /* =========================================================
+   FORCE DATABASE SAVE
+   ========================================================= */
+
+async function flushDatabaseSave() {
+  if (!supabaseReady || !data) return;
+
+  clearTimeout(supabaseSyncTimer);
+
+  try {
+    await syncToSupabase();
+  } catch (error) {
+    console.error("Final Supabase save failed:", error);
+  }
+}
+
+/* =========================================================
    START APPLICATION
    ========================================================= */
 
@@ -6820,10 +7444,10 @@ data =
 normalize();
 
 
-saveData();
-
-
 render();
+
+
+initializeDatabasePersistence();
 
 
 startGoogleAutoSync();
