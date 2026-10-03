@@ -6,7 +6,7 @@
 const STORAGE_KEY = "amoreWeddingPlanner_v4";
 
 const DATABASE_CONFIG = {
-  url: "https://gobjoyygnqeyncffniaj.supabase.co/rest/v1/",
+  url: "https://gobjoyygnqeyncffniaj.supabase.co",
   anonKey: "sb_publishable_zbEtRXfenh5mFTjpK9CpNQ_D6WeklkQ",
   enabled: true
 };
