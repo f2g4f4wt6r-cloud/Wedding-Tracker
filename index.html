@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Wedding Planner System</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside class="sidebar">
+    <div class="brand"><span>♥</span>CF</div>
+    <div class="brand-sub">;D</div>
+
+    <nav>
+      <button class="nav-item active" data-page="dashboard"><span>⌂</span> Home</button>
+      <button class="nav-item" data-page="budget"><span>₱</span> Budget</button>
+      <button class="nav-item" data-page="additional-expenses"><span>＋</span> Additional Expenses</button>
+      <button class="nav-item" data-page="guests"><span>♧</span> Guests</button>
+      <button class="nav-item" data-page="vendors"><span>▥</span> Vendors</button>
+      <button class="nav-item" data-page="tasks"><span>✓</span> Tasks</button>
+      <button class="nav-item" data-page="notes"><span>♡</span> Notes</button>
+    </nav>
+
+    <div class="sidebar-bottom">
+      <button class="nav-item" data-page="settings"><span>⚙</span> Settings</button>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="mobile-header">
+      <button id="menuBtn">☰</button>
+      <div><span>♥</span> CF</div>
+    </header>
+
+    <section id="dashboard" class="page active-page"></section>
+    <section id="budget" class="page"></section>
+    <section id="additional-expenses" class="page"></section>
+    <section id="guests" class="page"></section>
+    <section id="vendors" class="page"></section>
+    <section id="tasks" class="page"></section>
+    <section id="notes" class="page"></section>
+    <section id="settings" class="page"></section>
+  </main>
+
+  <div id="modalRoot"></div>
+  <div id="toast"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>
